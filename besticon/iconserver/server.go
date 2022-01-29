@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,9 +21,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/cors"
-
-	// Enable runtime profiling at /debug/pprof
-	_ "net/http/pprof"
 )
 
 func indexHandler(w http.ResponseWriter, r *http.Request) {
@@ -254,22 +252,35 @@ func renderHTMLTemplate(w http.ResponseWriter, httpStatus int, templ *template.T
 }
 
 func startServer(port string, address string) {
-	registerHandler("/", indexHandler)
-	registerHandler("/icons", iconsHandler)
 	registerHandler("/icon", iconHandler)
-	registerHandler("/popular", popularHandler)
 	registerHandler("/allicons.json", alliconsHandler)
 	registerHandler("/lettericons/", lettericonHandler)
 
-	serveAsset("/pure-0.5.0-min.css", "besticon/iconserver/assets/pure-0.5.0-min.css", oneYear)
-	serveAsset("/grids-responsive-0.5.0-min.css", "besticon/iconserver/assets/grids-responsive-0.5.0-min.css", oneYear)
-	serveAsset("/main-min.css", "besticon/iconserver/assets/main-min.css", oneYear)
+	disableBrowsePages := getTrueFromEnv("DISABLE_BROWSE_PAGES")
 
-	serveAsset("/icon.svg", "besticon/iconserver/assets/icon.svg", oneYear)
-	serveAsset("/favicon.ico", "besticon/iconserver/assets/favicon.ico", oneYear)
-	serveAsset("/apple-touch-icon.png", "besticon/iconserver/assets/apple-touch-icon.png", oneYear)
+	if !disableBrowsePages {
+		registerHandler("/", indexHandler)
+		registerHandler("/icons", iconsHandler)
+		registerHandler("/popular", popularHandler)
 
-	http.Handle("/metrics", promhttp.Handler())
+		serveAsset("/pure-0.5.0-min.css", "pure-0.5.0-min.css", oneYear)
+		serveAsset("/grids-responsive-0.5.0-min.css", "grids-responsive-0.5.0-min.css", oneYear)
+		serveAsset("/main-min.css", "main-min.css", oneYear)
+
+		serveAsset("/icon.svg", "icon.svg", oneYear)
+		serveAsset("/favicon.ico", "favicon.ico", oneYear)
+		serveAsset("/apple-touch-icon.png", "apple-touch-icon.png", oneYear)
+	}
+
+	metricsPath := getenvOrFallback("METRICS_PATH", "/metrics")
+
+	if metricsPath != "disable" {
+		if !strings.HasPrefix(metricsPath, "/") {
+			logger.Fatalf("METRICS_PATH must start with a slash")
+		}
+
+		http.Handle(metricsPath, promhttp.Handler())
+	}
 
 	addr := address + ":" + port
 	logger.Print("Starting server on ", addr, "...")
@@ -339,15 +350,25 @@ func addCacheControl(w http.ResponseWriter, maxAge int) {
 
 func serveAsset(path string, assetPath string, maxAgeSeconds int) {
 	registerHandler(path, func(w http.ResponseWriter, r *http.Request) {
-		assetInfo, err := assets.AssetInfo(assetPath)
+		f, err := assets.Assets.Open(assetPath)
+		if err != nil {
+			panic(err)
+		}
+		defer f.Close()
+
+		stat, err := f.Stat()
+		if err != nil {
+			panic(err)
+		}
+
+		data, err := io.ReadAll(f)
 		if err != nil {
 			panic(err)
 		}
 
 		addCacheControl(w, maxAgeSeconds)
 
-		http.ServeContent(w, r, assetInfo.Name(), assetInfo.ModTime(),
-			bytes.NewReader(assets.MustAsset(assetPath)))
+		http.ServeContent(w, r, stat.Name(), stat.ModTime(), bytes.NewReader(data))
 	})
 }
 
@@ -369,15 +390,18 @@ func main() {
 }
 
 func init() {
-	indexHTML = templateFromAsset("besticon/iconserver/assets/index.html", "index.html")
-	iconsHTML = templateFromAsset("besticon/iconserver/assets/icons.html", "icons.html")
-	popularHTML = templateFromAsset("besticon/iconserver/assets/popular.html", "popular.html")
-	notFoundHTML = templateFromAsset("besticon/iconserver/assets/not_found.html", "not_found.html")
+	indexHTML = templateFromAsset("index.html", "index.html")
+	iconsHTML = templateFromAsset("icons.html", "icons.html")
+	popularHTML = templateFromAsset("popular.html", "popular.html")
+	notFoundHTML = templateFromAsset("not_found.html", "not_found.html")
 }
 
 func templateFromAsset(assetPath, templateName string) *template.Template {
-	bytes := assets.MustAsset(assetPath)
-	return template.Must(template.New(templateName).Funcs(funcMap).Parse(string(bytes)))
+	data, err := assets.Assets.ReadFile(assetPath)
+	if err != nil {
+		panic(err)
+	}
+	return template.Must(template.New(templateName).Funcs(funcMap).Parse(string(data)))
 }
 
 var indexHTML *template.Template
